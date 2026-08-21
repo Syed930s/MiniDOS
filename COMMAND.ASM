@@ -1,3 +1,4 @@
+
 ; Standard FASM COM file format
 org 100h
 
@@ -32,7 +33,7 @@ msg_notfound db "File not found",13,10,"$"
 msg_presskey db "Press any key to continue . . .$"
 msg_dirmes db " File(s)",13,10,"$"
 msg_crlf db 13,10,"$"
-msg_ver db 13,10,"MiniCOM 3.1 MiniDOS 3.3 MiniBoot 1.9",13,10,"$"
+msg_ver db 13,10,"MiniDOS v2.1",13,10,"$"
 msg_echo_on db "ECHO is on",13,10,"$"
 msg_echo_off db "ECHO is off",13,10,"$"
 msg_created db "Directory created",13,10,"$"
