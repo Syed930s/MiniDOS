@@ -1,4 +1,8 @@
-; for kernel: format binary as "sys"
+; =====================================================================
+; MiniDOS Kernel
+; Format: Binary (SYS)
+; =====================================================================
+format binary as "sys"
 org 0x0000
 
 FT_USED         equ 0
@@ -12,6 +16,7 @@ FT_POS_HIGH     equ 13
 FT_DIR_PTR      equ 15
 FT_DIR_SEC      equ 17
 CONSOLE         equ 0FFFFh
+MAX_HANDLES     equ 20
 
 start:
     cli
@@ -67,18 +72,18 @@ start:
     xor ax, ax
     mov ds, ax
     mov word [0x20*4], terminate_process
-    mov word [0x20*4+2], 0x2000
     mov word [0x21*4], int21_handler
-    mov word [0x21*4+2], 0x2000
+    mov ax, cs
+    mov word [0x20*4+2], ax
+    mov word [0x21*4+2], ax
     push cs
     pop ds
 
-    ; init handles 0,1,2 as console
     mov cx, 3
     xor bx, bx
 .ci_loop:
     mov ax, bx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov di, ax
     mov word [di+FT_USED], 1
@@ -98,7 +103,7 @@ command_load_name db 'C','O','M','M','A','N','D',' ','C','O','M'
 current_dir db "\", 0
 dta_ptr dw 0x0080, 0x2000
 user_seg dw 0
-file_table rb 4 * 16
+file_table rb MAX_HANDLES * 32
 search_name db 13 dup(0)
 search_dir_idx dw 0
 buffer_name db 11 dup(' ')
@@ -107,7 +112,6 @@ new_name_buf db 11 dup(' ')
 create_attribs dw 0
 lae_sector dw 0
 lae_remaining dw 0
-retry_cnt rb 1
 kbuf db 0
 
 bpb_buffer rb 512
@@ -132,9 +136,13 @@ terminate_process:
     mov es, ax
     mov ss, ax
     mov sp, 0xFFFE
-    jmp 0x1000:0x0100
+    push ax
+    mov ax, 0x0100
+    push ax
+    retf
 
 int21_handler:
+    cld
     mov word [cs:user_seg], ds
     push ds
     push es
@@ -144,20 +152,34 @@ int21_handler:
     mov bx, word [user_seg]
     mov es, bx
 
+    cmp ah, 0x01
+    je .get_char_echo
     cmp ah, 0x02
     je .print_char
+    cmp ah, 0x06
+    je .direct_console
     cmp ah, 0x08
     je .get_char
     cmp ah, 0x09
     je .print_string
     cmp ah, 0x0A
     je .buffered_input
+    cmp ah, 0x19
+    je .get_drive
     cmp ah, 0x1A
     je .set_dta
+    cmp ah, 0x25
+    je .set_vector
     cmp ah, 0x2A
     je .get_date
     cmp ah, 0x2C
     je .get_time
+    cmp ah, 0x30
+    je .get_version
+    cmp ah, 0x35
+    je .get_vector
+    cmp ah, 0x36
+    je .get_free_space
     cmp ah, 0x39
     je .make_dir
     cmp ah, 0x3A
@@ -197,9 +219,106 @@ int21_handler:
     stc
     jmp .exit
 
-; ---------- console-aware output ----------
+.set_vector:
+    push es
+    push bx
+    xor bx, bx
+    mov es, bx
+    mov bl, al
+    shl bx, 2
+    mov word [es:bx], dx
+    mov word [es:bx+2], ds
+    pop bx
+    pop es
+    clc
+    jmp .exit
+
+.get_vector:
+    push ds
+    push si
+    xor si, si
+    mov ds, si
+    mov si, ax
+    and si, 0xFF
+    shl si, 2
+    mov bx, word [ds:si]
+    mov es, word [ds:si+2]
+    pop si
+    pop ds
+    clc
+    jmp .exit
+
+.get_char_echo:
+    mov ah, 0x00
+    int 0x16
+    mov dl, al
+    push ax
+    mov ah, 0x0E
+    mov bx, 0x0007
+    int 0x10
+    pop ax
+    clc
+    jmp .exit
+
+.direct_console:
+    cmp dl, 0xFF
+    je .dc_input
+.dc_output:
+    mov ah, 0x0E
+    mov bx, 0x0007
+    int 0x10
+    clc
+    jmp .exit
+.dc_input:
+    mov ah, 0x01
+    int 0x16
+    jz .dc_no_char
+    clc
+    jmp .exit
+.dc_no_char:
+    stc
+    jmp .exit
+
+.get_drive:
+    mov al, 0
+    clc
+    jmp .exit
+
+.get_version:
+    mov al, 7
+    mov bx, 0
+    mov cx, 0
+    mov dx, 0
+    clc
+    jmp .exit
+
+.get_free_space:
+    push cx
+    push dx
+    push si
+    mov cx, 2
+    xor bx, bx
+.fat_scan:
+    mov ax, cx
+    call get_fat_entry
+    test ax, ax
+    jnz .fat_used
+    inc bx
+.fat_used:
+    inc cx
+    cmp cx, 4085
+    jb .fat_scan
+    mov ax, word [sec_per_clus]
+    mov cx, 512
+    mov dx, 4085
+    pop si
+    pop dx
+    pop cx
+    clc
+    jmp .exit
+
 .print_char:
-    cmp word [file_table+16+FT_DIR_PTR], CONSOLE
+    cmp word [file_table+32+FT_DIR_PTR], CONSOLE
     jne .pc_file
     push bx
     mov al, dl
@@ -223,7 +342,7 @@ int21_handler:
     jmp .exit
 
 .print_string:
-    cmp word [file_table+16+FT_DIR_PTR], CONSOLE
+    cmp word [file_table+32+FT_DIR_PTR], CONSOLE
     jne .ps_file
     push si
     mov si, dx
@@ -258,9 +377,8 @@ int21_handler:
     pop word [cs:user_seg]
     mov bx, 1
     mov dx, si
-    sub dx, cx          ; start
+    sub dx, cx
     push cx
-    mov cx, cx
     call do_write
     pop cx
     pop word [cs:user_seg]
@@ -269,7 +387,6 @@ int21_handler:
     clc
     jmp .exit
 
-; ---------- console-aware input ----------
 .get_char:
     cmp word [file_table+FT_DIR_PTR], CONSOLE
     jne .gc_file
@@ -383,7 +500,7 @@ int21_handler:
     inc si
     jmp .bif_loop
 .bif_eof:
-    call reset_console0
+    call .reset_console0
 .bif_done:
     mov ax, si
     mov byte [es:bp+1], al
@@ -395,18 +512,10 @@ int21_handler:
     clc
     jmp .exit
 
-reset_console0:
+.reset_console0:
     mov di, file_table
     mov word [di+FT_USED], 1
-    mov word [di+FT_START_CL], 0
-    mov word [di+FT_CURRENT_CL], 0
-    mov word [di+FT_SECTORS_IN_CL], 0
-    mov word [di+FT_SIZE_LOW], 0
-    mov word [di+FT_SIZE_HIGH], 0
-    mov word [di+FT_POS_LOW], 0
-    mov word [di+FT_POS_HIGH], 0
     mov word [di+FT_DIR_PTR], CONSOLE
-    mov word [di+FT_DIR_SEC], 0
     ret
 
 .set_dta:
@@ -457,23 +566,26 @@ reset_console0:
 .get_current_dir:
     push si
     push di
-    mov di, dx
+    mov di, si
     mov si, current_dir
-.gc_loop:
+    cmp byte [si], '\'
+    jne .gc_copy
+    inc si
+.gc_copy:
     lodsb
     stosb
     test al, al
-    jnz .gc_loop
+    jnz .gc_copy
     pop di
     pop si
     clc
     jmp .exit
 
 .lseek:
-    cmp bx, 4
+    cmp bx, MAX_HANDLES
     jae .ls_fail
     mov ax, bx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov bp, ax
     cmp word [bp+FT_USED], 0
@@ -492,16 +604,15 @@ reset_console0:
 .dup:
     call alloc_file_handle
     jc .exit
-    mov di, ax
     push ax
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov di, ax
     mov ax, bx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov si, ax
-    mov cx, 8
+    mov cx, 10
     rep movsw
     pop ax
     clc
@@ -511,7 +622,7 @@ reset_console0:
     push bx
     push cx
     mov ax, cx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov si, ax
     cmp word [si+FT_USED], 0
@@ -519,14 +630,14 @@ reset_console0:
     mov word [si+FT_USED], 0
 .d2_copy:
     mov ax, cx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov di, ax
     mov ax, bx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov si, ax
-    mov cx, 8
+    mov cx, 10
     rep movsw
     pop cx
     pop bx
@@ -540,13 +651,10 @@ reset_console0:
     jc .of_fail
     call alloc_file_handle
     jc .of_fail
-
     mov dx, ax
-    mov ax, dx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov bx, ax
-
     mov word [bx + FT_USED], 1
     mov ax, word [es:di + 26]
     mov word [bx + FT_START_CL], ax
@@ -561,7 +669,6 @@ reset_console0:
     mov word [bx + FT_DIR_PTR], di
     mov cx, word [search_sec_current]
     mov word [bx + FT_DIR_SEC], cx
-
     mov ax, dx
     clc
     jmp .exit
@@ -571,10 +678,10 @@ reset_console0:
     jmp .exit
 
 .close_file:
-    cmp bx, 4
+    cmp bx, MAX_HANDLES
     jae .cf_fail
     mov ax, bx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov si, ax
     cmp word [si + FT_USED], 0
@@ -588,7 +695,7 @@ reset_console0:
     jmp .exit
 
 .read_file:
-    cmp bx, 4
+    cmp bx, MAX_HANDLES
     jae .rf_fail
     call do_read
     clc
@@ -598,121 +705,8 @@ reset_console0:
     stc
     jmp .exit
 
-do_read:
-    mov ax, bx
-    shl ax, 4
-    add ax, file_table
-    mov bp, ax
-    cmp word [bp + FT_USED], 0
-    je .dr_zero
-
-    push bx
-    push cx
-    push dx
-    push es
-    push bp
-    mov word [bytes_read], 0
-    mov word [req_bytes], cx
-
-.dr_loop:
-    mov ax, word [bytes_read]
-    cmp ax, word [req_bytes]
-    jge .dr_done
-
-    ; stop at EOF
-    mov ax, word [bp+FT_POS_LOW]
-    cmp ax, word [bp+FT_SIZE_LOW]
-    jb .dr_ok
-    mov ax, word [bp+FT_POS_HIGH]
-    cmp ax, word [bp+FT_SIZE_HIGH]
-    jb .dr_ok
-    jmp .dr_done
-.dr_ok:
-    mov ax, word [bp + FT_CURRENT_CL]
-    sub ax, 2
-    xor dx, dx
-    mov bx, word [sec_per_clus]
-    mul bx
-    add ax, word [first_data_sec]
-    add ax, word [bp + FT_SECTORS_IN_CL]
-    mov cx, ax
-
-    push cx
-    push dx
-    push bp
-    mov bx, 0x3000
-    mov es, bx
-    xor bx, bx
-    call read_sector_int13
-    pop bp
-    pop dx
-    pop cx
-
-    mov ax, word [bp + FT_POS_LOW]
-    and ax, 511
-    mov bx, 512
-    sub bx, ax
-
-    mov ax, word [req_bytes]
-    sub ax, word [bytes_read]
-    cmp ax, bx
-    jbe .dr_copy
-    mov bx, ax
-.dr_copy:
-    push ds
-    push es
-    push si
-    push di
-    push cx
-    mov cx, bx
-    mov ax, word [bp + FT_POS_LOW]
-    and ax, 511
-    mov si, ax
-    mov ax, 0x3000
-    mov ds, ax
-    mov ax, word [user_seg]
-    mov es, ax
-    mov di, dx
-    rep movsb
-    pop cx
-    pop di
-    pop si
-    pop es
-    pop ds
-
-    push cs
-    pop ds
-
-    add word [bytes_read], bx
-    add dx, bx
-    add word [bp + FT_POS_LOW], bx
-    adc word [bp + FT_POS_HIGH], 0
-
-    inc word [bp + FT_SECTORS_IN_CL]
-    mov ax, word [bp + FT_SECTORS_IN_CL]
-    cmp ax, word [sec_per_clus]
-    jb .dr_loop
-
-    mov word [bp + FT_SECTORS_IN_CL], 0
-    mov ax, word [bp + FT_CURRENT_CL]
-    call get_fat_entry
-    mov word [bp + FT_CURRENT_CL], ax
-    jmp .dr_loop
-
-.dr_done:
-    mov ax, word [bytes_read]
-    pop bp
-    pop es
-    pop dx
-    pop cx
-    pop bx
-    ret
-.dr_zero:
-    xor ax, ax
-    ret
-
 .write_file:
-    cmp bx, 4
+    cmp bx, MAX_HANDLES
     jae .wf_fail
     call do_write
     clc
@@ -722,197 +716,17 @@ do_read:
     stc
     jmp .exit
 
-do_write:
-    mov ax, bx
-    shl ax, 4
-    add ax, file_table
-    mov bp, ax
-    cmp word [bp + FT_USED], 0
-    je .dw_zero
-
-    push bx
-    push cx
-    push dx
-    push es
-    push bp
-    mov word [bytes_written], 0
-    mov word [req_bytes], cx
-
-.dw_loop:
-    mov ax, word [bytes_written]
-    cmp ax, word [req_bytes]
-    jge .dw_done
-
-    mov ax, word [bp + FT_CURRENT_CL]
-    test ax, ax
-    jnz .dw_has
-
-    call find_free_cluster
-    test ax, ax
-    jz .dw_ioerr
-    mov word [bp + FT_START_CL], ax
-    mov word [bp + FT_CURRENT_CL], ax
-    mov dx, 0xFFF
-    call set_fat_entry
-
-.dw_has:
-    mov ax, word [bp + FT_CURRENT_CL]
-    sub ax, 2
-    xor dx, dx
-    mov bx, word [sec_per_clus]
-    mul bx
-    add ax, word [first_data_sec]
-    add ax, word [bp + FT_SECTORS_IN_CL]
-    mov cx, ax
-
-    mov ax, word [bp + FT_POS_LOW]
-    and ax, 511
-    mov bx, 512
-    sub bx, ax
-
-    mov ax, word [req_bytes]
-    sub ax, word [bytes_written]
-    cmp ax, bx
-    jbe .dw_copy
-    mov bx, ax
-.dw_copy:
-    push cx
-    push bx
-    mov bx, 0x3000
-    mov es, bx
-    xor bx, bx
-    call read_sector_int13
-    pop bx
-    pop cx
-
-    push ds
-    push es
-    push si
-    push di
-    push cx
-    mov ax, word [bp + FT_POS_LOW]
-    and ax, 511
-    mov di, ax
-    mov ax, 0x3000
-    mov es, ax
-    mov ax, word [user_seg]
-    mov ds, ax
-    mov si, dx
-    mov cx, bx
-    rep movsb
-    pop cx
-    pop di
-    pop si
-    pop es
-    pop ds
-
-    push cs
-    pop ds
-
-    push cx
-    push bx
-    mov bx, 0x3000
-    mov es, bx
-    xor bx, bx
-    call write_sector_int13
-    pop bx
-    pop cx
-
-    add word [bytes_written], bx
-    add dx, bx
-    add word [bp + FT_POS_LOW], bx
-    adc word [bp + FT_POS_HIGH], 0
-
-    inc word [bp + FT_SECTORS_IN_CL]
-    mov ax, word [bp + FT_SECTORS_IN_CL]
-    cmp ax, word [sec_per_clus]
-    jb .dw_loop
-
-    mov word [bp + FT_SECTORS_IN_CL], 0
-    mov ax, word [bp + FT_CURRENT_CL]
-    call get_fat_entry
-
-    cmp ax, 0xFF8
-    jb .dw_next
-
-    call find_free_cluster
-    test ax, ax
-    jz .dw_ioerr
-
-    push ax
-    mov dx, ax
-    mov ax, word [bp + FT_CURRENT_CL]
-    call set_fat_entry
-    pop ax
-    mov dx, 0xFFF
-    call set_fat_entry
-
-.dw_next:
-    mov word [bp + FT_CURRENT_CL], ax
-    jmp .dw_loop
-
-.dw_done:
-    ; update size + dir entry
-    mov ax, word [bp + FT_POS_LOW]
-    mov dx, word [bp + FT_POS_HIGH]
-    cmp dx, word [bp + FT_SIZE_HIGH]
-    ja .dw_up
-    jb .dw_skip
-    cmp ax, word [bp + FT_SIZE_LOW]
-    jbe .dw_skip
-.dw_up:
-    mov word [bp + FT_SIZE_LOW], ax
-    mov word [bp + FT_SIZE_HIGH], dx
-
-    mov cx, word [bp + FT_DIR_SEC]
-    mov bx, 0x3000
-    mov es, bx
-    xor bx, bx
-    call read_sector_int13
-
-    mov di, word [bp + FT_DIR_PTR]
-    mov ax, word [bp + FT_SIZE_LOW]
-    mov word [es:di + 20h], ax
-    mov ax, word [bp + FT_SIZE_HIGH]
-    mov word [es:di + 22h], ax
-
-    mov cx, word [bp + FT_DIR_SEC]
-    xor bx, bx
-    call write_sector_int13
-
-.dw_skip:
-    mov ax, word [bytes_written]
-    pop bp
-    pop es
-    pop dx
-    pop cx
-    pop bx
-    ret
-.dw_ioerr:
-    pop bp
-    pop es
-    pop dx
-    pop cx
-    pop bx
-    mov ax, 0
-    ret
-.dw_zero:
-    xor ax, ax
-    ret
-
 .create_file:
     mov word [create_attribs], cx
     call parse_filename
     jc .cre_fail
     call search_root_dir
     jnc .cre_fail_exists
-
     call find_empty_dir_entry
     jc .cre_fail_full
 
     mov bx, 0x3000
     mov es, bx
-
     push di
     mov cx, 32
     xor al, al
@@ -926,7 +740,6 @@ do_write:
     mov cx, 11
     rep movsb
     pop di
-
     push cs
     pop ds
 
@@ -949,10 +762,9 @@ do_write:
     jc .cre_fail_handles
 
     mov dx, ax
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov bx, ax
-
     mov word [bx + FT_USED], 1
     mov word [bx + FT_START_CL], 0
     mov word [bx + FT_CURRENT_CL], 0
@@ -964,7 +776,6 @@ do_write:
     mov word [bx + FT_DIR_PTR], di
     mov cx, word [search_sec_current]
     mov word [bx + FT_DIR_SEC], cx
-
     mov ax, dx
     clc
     jmp .exit
@@ -994,26 +805,20 @@ do_write:
     jc .del_fail
     call search_root_dir
     jc .del_fail
-
     mov bx, 0x3000
     mov ds, bx
     mov ax, word [di + 26]
-
     push ax
     push cs
     pop ds
-
     mov bx, 0x3000
     mov es, bx
     mov byte [es:di], 0xE5
-
     mov cx, word [search_sec_current]
     xor bx, bx
     call write_sector_int13
-
     pop ax
     call free_cluster_chain
-
     clc
     jmp .exit
 .del_fail:
@@ -1024,7 +829,6 @@ do_write:
 .rename_file:
     push di
     call parse_filename
-
     push es
     push di
     push cs
@@ -1085,7 +889,6 @@ do_write:
     mov si, new_name_buf
     pop di
     pop es
-
     mov cx, 11
     rep movsb
 
@@ -1093,7 +896,6 @@ do_write:
     xor bx, bx
     call write_sector_int13
     jc .rename_fail_io
-
     clc
     jmp .exit
 .rename_fail_exists:
@@ -1148,6 +950,8 @@ do_write:
     je .dp_ext
     stosb
     loop .dp_name
+    cmp byte [si], '.'
+    je .dp_ext
     jmp .dp_ext_done
 .dp_ext:
     mov di, buffer_name + 8
@@ -1194,10 +998,8 @@ do_write:
     mov al, byte [es:di + 11]
     test al, 0x18
     jnz .ff_advance
-
     call match_entry
     jnc .ff_found
-
 .ff_advance:
     add di, 32
     inc bx
@@ -1206,7 +1008,6 @@ do_write:
     mov dx, bx
     and dx, 15
     jnz .ff_search
-
     inc cx
     push bx
     mov bx, 0x3000
@@ -1248,7 +1049,6 @@ do_write:
     mov [es:di+1Ch], ax
 
     add di, 1Eh
-
     mov cx, 8
 .name_loop:
     mov al, [si]
@@ -1259,10 +1059,8 @@ do_write:
 .name_skip:
     inc si
     loop .name_loop
-
     mov byte [es:di], '.'
     inc di
-
     mov cx, 3
 .ext_loop:
     mov al, [si]
@@ -1273,15 +1071,12 @@ do_write:
 .ext_skip:
     inc si
     loop .ext_loop
-
     mov byte [es:di], 0
-
     push cs
     pop ds
     pop es
     clc
     jmp .exit
-
 .ff_fail:
     mov ax, 0x0012
     stc
@@ -1292,6 +1087,285 @@ do_write:
     pop es
     pop ds
     iret
+
+do_read:
+    mov ax, bx
+    shl ax, 5
+    add ax, file_table
+    mov bp, ax
+    cmp word [bp + FT_USED], 0
+    je .dr_zero
+
+    push bx
+    push cx
+    push dx
+    push es
+    push bp
+    mov word [bytes_read], 0
+    mov word [req_bytes], cx
+
+.dr_loop:
+    mov ax, word [bytes_read]
+    cmp ax, word [req_bytes]
+    jge .dr_done
+    mov ax, word [bp+FT_POS_LOW]
+    cmp ax, word [bp+FT_SIZE_LOW]
+    jb .dr_ok
+    mov ax, word [bp+FT_POS_HIGH]
+    cmp ax, word [bp+FT_SIZE_HIGH]
+    jb .dr_ok
+    jmp .dr_done
+.dr_ok:
+    mov ax, word [bp + FT_CURRENT_CL]
+    sub ax, 2
+    xor dx, dx
+    mov bx, word [sec_per_clus]
+    mul bx
+    add ax, word [first_data_sec]
+    add ax, word [bp + FT_SECTORS_IN_CL]
+    mov cx, ax
+
+    push cx
+    push dx
+    push bp
+    mov bx, 0x3000
+    mov es, bx
+    xor bx, bx
+    call read_sector_int13
+    pop bp
+    pop dx
+    pop cx
+
+    mov ax, word [bp + FT_POS_LOW]
+    and ax, 511
+    mov bx, 512
+    sub bx, ax
+    mov ax, word [req_bytes]
+    sub ax, word [bytes_read]
+    cmp ax, bx
+    jbe .dr_copy
+.dr_copy:
+    push ds
+    push es
+    push si
+    push di
+    push cx
+    mov cx, bx
+    mov ax, word [bp + FT_POS_LOW]
+    and ax, 511
+    mov si, ax
+    mov ax, 0x3000
+    mov ds, ax
+    mov ax, word [user_seg]
+    mov es, ax
+    mov di, dx
+    rep movsb
+    pop cx
+    pop di
+    pop si
+    pop es
+    pop ds
+    push cs
+    pop ds
+
+    add word [bytes_read], bx
+    add dx, bx
+    add word [bp + FT_POS_LOW], bx
+    adc word [bp + FT_POS_HIGH], 0
+
+    inc word [bp + FT_SECTORS_IN_CL]
+    mov ax, word [bp + FT_SECTORS_IN_CL]
+    cmp ax, word [sec_per_clus]
+    jb .dr_loop
+
+    mov word [bp + FT_SECTORS_IN_CL], 0
+    mov ax, word [bp + FT_CURRENT_CL]
+    call get_fat_entry
+    mov word [bp + FT_CURRENT_CL], ax
+    jmp .dr_loop
+
+.dr_done:
+    mov ax, word [bytes_read]
+    pop bp
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    ret
+.dr_zero:
+    xor ax, ax
+    ret
+
+do_write:
+    mov ax, bx
+    shl ax, 5
+    add ax, file_table
+    mov bp, ax
+    cmp word [bp + FT_USED], 0
+    je .dw_zero
+
+    push bx
+    push cx
+    push dx
+    push es
+    push bp
+    mov word [bytes_written], 0
+    mov word [req_bytes], cx
+
+.dw_loop:
+    mov ax, word [bytes_written]
+    cmp ax, word [req_bytes]
+    jge .dw_done
+
+    mov ax, word [bp + FT_CURRENT_CL]
+    test ax, ax
+    jnz .dw_has
+    call find_free_cluster
+    test ax, ax
+    jz .dw_ioerr
+    mov word [bp + FT_START_CL], ax
+    mov word [bp + FT_CURRENT_CL], ax
+    mov dx, 0xFFF
+    call set_fat_entry
+
+.dw_has:
+    mov ax, word [bp + FT_CURRENT_CL]
+    sub ax, 2
+    xor dx, dx
+    mov bx, word [sec_per_clus]
+    mul bx
+    add ax, word [first_data_sec]
+    add ax, word [bp + FT_SECTORS_IN_CL]
+    mov cx, ax
+
+    mov ax, word [bp + FT_POS_LOW]
+    and ax, 511
+    mov bx, 512
+    sub bx, ax
+    mov ax, word [req_bytes]
+    sub ax, word [bytes_written]
+    cmp ax, bx
+    jbe .dw_copy
+.dw_copy:
+    push cx
+    push bx
+    mov bx, 0x3000
+    mov es, bx
+    xor bx, bx
+    call read_sector_int13
+    pop bx
+    pop cx
+
+    push ds
+    push es
+    push si
+    push di
+    push cx
+    mov ax, word [bp + FT_POS_LOW]
+    and ax, 511
+    mov di, ax
+    mov ax, 0x3000
+    mov es, ax
+    mov ax, word [user_seg]
+    mov ds, ax
+    mov si, dx
+    mov cx, bx
+    rep movsb
+    pop cx
+    pop di
+    pop si
+    pop es
+    pop ds
+    push cs
+    pop ds
+
+    push cx
+    push bx
+    mov bx, 0x3000
+    mov es, bx
+    xor bx, bx
+    call write_sector_int13
+    pop bx
+    pop cx
+
+    add word [bytes_written], bx
+    add dx, bx
+    add word [bp + FT_POS_LOW], bx
+    adc word [bp + FT_POS_HIGH], 0
+
+    inc word [bp + FT_SECTORS_IN_CL]
+    mov ax, word [bp + FT_SECTORS_IN_CL]
+    cmp ax, word [sec_per_clus]
+    jb .dw_loop
+
+    mov word [bp + FT_SECTORS_IN_CL], 0
+    mov ax, word [bp + FT_CURRENT_CL]
+    call get_fat_entry
+    cmp ax, 0xFF8
+    jb .dw_next
+
+    call find_free_cluster
+    test ax, ax
+    jz .dw_ioerr
+    push ax
+    mov dx, ax
+    mov ax, word [bp + FT_CURRENT_CL]
+    call set_fat_entry
+    pop ax
+    mov dx, 0xFFF
+    call set_fat_entry
+
+.dw_next:
+    mov word [bp + FT_CURRENT_CL], ax
+    jmp .dw_loop
+
+.dw_done:
+    mov ax, word [bp + FT_POS_LOW]
+    mov dx, word [bp + FT_POS_HIGH]
+    cmp dx, word [bp + FT_SIZE_HIGH]
+    ja .dw_up
+    jb .dw_skip
+    cmp ax, word [bp + FT_SIZE_LOW]
+    jbe .dw_skip
+.dw_up:
+    mov word [bp + FT_SIZE_LOW], ax
+    mov word [bp + FT_SIZE_HIGH], dx
+
+    mov cx, word [bp + FT_DIR_SEC]
+    mov bx, 0x3000
+    mov es, bx
+    xor bx, bx
+    call read_sector_int13
+
+    mov di, word [bp + FT_DIR_PTR]
+    mov ax, word [bp + FT_SIZE_LOW]
+    mov word [es:di + 20h], ax
+    mov ax, word [bp + FT_SIZE_HIGH]
+    mov word [es:di + 22h], ax
+
+    mov cx, word [bp + FT_DIR_SEC]
+    xor bx, bx
+    call write_sector_int13
+
+.dw_skip:
+    mov ax, word [bytes_written]
+    pop bp
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    ret
+.dw_ioerr:
+    pop bp
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    mov ax, 0
+    ret
+.dw_zero:
+    xor ax, ax
+    ret
 
 match_entry:
     push si
@@ -1323,8 +1397,6 @@ match_entry:
     dec cx
     jnz .fl
 .fok:
-    add si, cx
-    add di, cx
     clc
     ret
 .fno:
@@ -1390,17 +1462,14 @@ search_root_dir:
     mov word [search_sec_current], ax
     mov ax, word [root_dir_sectors]
     mov word [search_sec_remaining], ax
-
 .search_loop:
     cmp word [search_sec_remaining], 0
     je .not_found
-
     mov cx, word [search_sec_current]
     mov bx, 0x3000
     mov es, bx
     xor bx, bx
     call read_sector_int13
-
     mov cx, 16
     xor di, di
 .search_entry:
@@ -1414,11 +1483,9 @@ search_root_dir:
     je .found
     add di, 32
     loop .search_entry
-
     inc word [search_sec_current]
     dec word [search_sec_remaining]
     jmp .search_loop
-
 .found:
     clc
     ret
@@ -1431,17 +1498,14 @@ find_empty_dir_entry:
     mov word [search_sec_current], ax
     mov ax, word [root_dir_sectors]
     mov word [search_sec_remaining], ax
-
 .fed_loop:
     cmp word [search_sec_remaining], 0
     je .fed_not_found
-
     mov cx, word [search_sec_current]
     mov bx, 0x3000
     mov es, bx
     xor bx, bx
     call read_sector_int13
-
     mov cx, 16
     xor di, di
 .fed_entry:
@@ -1452,11 +1516,9 @@ find_empty_dir_entry:
     je .fed_found
     add di, 32
     loop .fed_entry
-
     inc word [search_sec_current]
     dec word [search_sec_remaining]
     jmp .fed_loop
-
 .fed_found:
     clc
     ret
@@ -1465,11 +1527,11 @@ find_empty_dir_entry:
     ret
 
 alloc_file_handle:
-    mov cx, 4
+    mov cx, MAX_HANDLES
     xor bx, bx
 .afh_loop:
     mov ax, bx
-    shl ax, 4
+    shl ax, 5
     add ax, file_table
     mov si, ax
     cmp word [si + FT_USED], 0
@@ -1487,15 +1549,12 @@ get_fat_entry:
     push bx
     push cx
     push es
-
     mov bx, ax
     shr bx, 1
     add bx, ax
-
     mov cx, bx
     shr cx, 9
     add cx, word [resvd_sec_cnt]
-
     push bx
     push ax
     mov ax, cx
@@ -1505,10 +1564,8 @@ get_fat_entry:
     call read_sector_int13
     pop ax
     pop bx
-
     and bx, 0x1FF
     mov dx, word [es:bx]
-
     test ax, 1
     jz .gfe_even
     shr dx, 4
@@ -1528,15 +1585,12 @@ set_fat_entry:
     push es
     push si
     mov si, dx
-
     mov bx, ax
     shr bx, 1
     add bx, ax
-
     mov cx, bx
     shr cx, 9
     add cx, word [resvd_sec_cnt]
-
     push bx
     push ax
     push cx
@@ -1548,9 +1602,7 @@ set_fat_entry:
     pop cx
     pop ax
     pop bx
-
     and bx, 0x1FF
-
     test ax, 1
     jz .sfe_even
     mov ax, word [es:bx]
@@ -1565,13 +1617,11 @@ set_fat_entry:
     and si, 0x0FFF
     or ax, si
     mov word [es:bx], ax
-
 .sfe_write:
     mov bx, 0x3000
     mov es, bx
     xor bx, bx
     call write_sector_int13
-
     pop si
     pop es
     pop cx
@@ -1610,15 +1660,12 @@ free_cluster_chain:
     jz .fcc_done
     cmp ax, 0xFF8
     jae .fcc_done
-
     mov cx, ax
     call get_fat_entry
     push ax
-
     mov ax, cx
     xor dx, dx
     call set_fat_entry
-
     pop ax
     jmp .fcc_loop
 .fcc_done:
@@ -1629,12 +1676,10 @@ free_cluster_chain:
 
 read_sector_int13:
     push ax
-    push bx
     push cx
     push dx
     push es
     mov word [sector_tmp], cx
-    mov byte [retry_cnt], 5
 .rsi_chs:
     xor dx, dx
     mov ax, word [sector_tmp]
@@ -1650,37 +1695,25 @@ read_sector_int13:
     mov al, 1
     int 0x13
     jnc .rsi_ok
-    dec byte [retry_cnt]
-    jz .rsi_quit
     push ax
     xor ah, ah
     mov dl, 0
     int 0x13
     pop ax
     jmp .rsi_chs
-.rsi_quit:
-    pop es
-    pop dx
-    pop cx
-    pop bx
-    pop ax
-    ret
 .rsi_ok:
     pop es
     pop dx
     pop cx
-    pop bx
     pop ax
     ret
 
 write_sector_int13:
     push ax
-    push bx
     push cx
     push dx
     push es
     mov word [sector_tmp], cx
-    mov byte [retry_cnt], 5
 .wsi_chs:
     xor dx, dx
     mov ax, word [sector_tmp]
@@ -1696,32 +1729,21 @@ write_sector_int13:
     mov al, 1
     int 0x13
     jnc .wsi_ok
-    dec byte [retry_cnt]
-    jz .wsi_quit
     push ax
     xor ah, ah
     mov dl, 0
     int 0x13
     pop ax
     jmp .wsi_chs
-.wsi_quit:
-    pop es
-    pop dx
-    pop cx
-    pop bx
-    pop ax
-    ret
 .wsi_ok:
     pop es
     pop dx
     pop cx
-    pop bx
     pop ax
     ret
 
 load_and_exec:
     cld
-
     mov ax, word [first_root_dir_sec]
     mov word [lae_sector], ax
     mov ax, word [root_dir_sectors]
@@ -1730,7 +1752,6 @@ load_and_exec:
 .lae_next_sec:
     cmp word [lae_remaining], 0
     je hang
-
     mov cx, word [lae_sector]
     mov bx, 0x3000
     mov es, bx
@@ -1740,9 +1761,11 @@ load_and_exec:
     mov cx, 16
     xor di, di
 .lae_entry:
-    cmp byte [es:di], 0x00
-    je hang
-
+    mov al, byte [es:di]
+    cmp al, 0xE5
+    je .lae_skip
+    cmp al, 0x00
+    je .lae_skip
     mov si, command_load_name
     push di
     push cx
@@ -1751,7 +1774,7 @@ load_and_exec:
     pop cx
     pop di
     je .lae_found
-
+.lae_skip:
     add di, 32
     loop .lae_entry
 
@@ -1806,7 +1829,6 @@ load_and_exec:
     mov bx, ax
     shr bx, 1
     add bx, ax
-
     mov cx, bx
     shr cx, 9
     add cx, word [resvd_sec_cnt]
@@ -1841,10 +1863,8 @@ load_and_exec:
     mov es, ax
     mov ss, ax
     mov sp, 0xFFFE
-
-    mov word [es:0x0080], 0x0080
-    mov word [es:0x0082], 0x1000
-
+    mov byte [es:0x0080], 0
+    mov byte [es:0x0081], 0x0D
     push ax
     mov ax, 0x0100
     push ax

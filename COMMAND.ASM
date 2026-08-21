@@ -1,5 +1,8 @@
-
-; Standard FASM COM file format
+; =====================================================================
+; MiniDOS COMMAND.COM
+; Format: Binary (COM)
+; =====================================================================
+format binary as "com"
 org 100h
 
 start:
@@ -26,6 +29,7 @@ str_copy db "COPY",0
 str_pause db "PAUSE",0
 str_date db "DATE",0
 str_time db "TIME",0
+str_mem db "MEM",0
 
 msg_badcmd db 13,10,"Bad command or file name",13,10,"$"
 msg_copied db " File(s) copied",13,10,"$"
@@ -40,6 +44,8 @@ msg_created db "Directory created",13,10,"$"
 msg_removed db "Directory removed",13,10,"$"
 msg_chgd db "Directory changed",13,10,"$"
 msg_cwd db "Current directory is $"
+msg_mem db "Total Clusters: $"
+msg_mem_free db 13,10,"Free Clusters: $"
 
 dta_buf rb 44
 find_name db 64 dup(0)
@@ -59,6 +65,7 @@ saved_stdout dw 0
 saved_stdin dw 0
 pipe_active db 0
 pipe_right dw 0
+bat_char_buf rb 1
 
 main:
     push cs
@@ -167,9 +174,6 @@ parse_cmd:
     mov byte [cmd_upper], 0
     ret
 
-; ==================================================
-; pre_process_io  --  >, <, |   (handle-saving scheme)
-; ==================================================
 pre_process_io:
     mov si, cmd_buf+2
 .scan:
@@ -194,11 +198,11 @@ pre_process_io:
     mov ah, 3Ch
     int 21h
     jc .done_io
-    mov word [saved_stdout], ax     ; remember the FILE handle
+    mov word [saved_stdout], ax
     mov bx, ax
     mov cx, 1
     mov ah, 46h
-    int 21h                         ; stdout -> file
+    int 21h
     jmp .done_io
 
 .handle_in:
@@ -214,7 +218,7 @@ pre_process_io:
     mov bx, ax
     mov cx, 0
     mov ah, 46h
-    int 21h                         ; stdin -> file
+    int 21h
     jmp .done_io
 
 .handle_pipe:
@@ -232,13 +236,10 @@ pre_process_io:
     mov bx, ax
     mov cx, 1
     mov ah, 46h
-    int 21h                         ; stdout -> pipe file
+    int 21h
 .done_io:
     ret
 
-; ==================================================
-; post_process_io -- restore console, run pipe right side
-; ==================================================
 post_process_io:
     cmp byte [pipe_active], 1
     je .do_pipe
@@ -247,11 +248,11 @@ post_process_io:
     je .check_in
     mov bx, word [saved_stdout]
     mov ah, 3Eh
-    int 21h                         ; close the file
+    int 21h
     mov bx, 0
     mov cx, 1
     mov ah, 46h
-    int 21h                         ; console back onto stdout
+    int 21h
     mov word [saved_stdout], 0
 
 .check_in:
@@ -263,7 +264,7 @@ post_process_io:
     mov bx, 1
     mov cx, 0
     mov ah, 46h
-    int 21h                         ; console back onto stdin
+    int 21h
     mov word [saved_stdin], 0
 .done_post:
     ret
@@ -272,11 +273,11 @@ post_process_io:
     mov byte [pipe_active], 0
     mov bx, word [saved_stdout]
     mov ah, 3Eh
-    int 21h                         ; close pipe writer
+    int 21h
     mov bx, 0
     mov cx, 1
     mov ah, 46h
-    int 21h                         ; console stdout back
+    int 21h
     mov word [saved_stdout], 0
 
     mov dx, pipe_file
@@ -287,7 +288,7 @@ post_process_io:
     mov bx, ax
     mov cx, 0
     mov ah, 46h
-    int 21h                         ; stdin -> pipe file
+    int 21h
 
     mov si, word [pipe_right]
     mov di, cmd_buf+2
@@ -298,7 +299,9 @@ post_process_io:
     jnz .copy_right
 
     call parse_cmd
+    call pre_process_io
     call dispatch
+    call post_process_io
 
     mov bx, word [saved_stdin]
     mov ah, 3Eh
@@ -373,6 +376,9 @@ dispatch:
     mov di, str_time
     call strcmp
     je .do_time
+    mov di, str_mem
+    call strcmp
+    je .do_mem
 
 .do_exec: call cmd_exec
     ret
@@ -403,6 +409,8 @@ dispatch:
 .do_date: call cmd_date
     ret
 .do_time: call cmd_time
+    ret
+.do_mem: call cmd_mem
     ret
 
 strcmp:
@@ -707,6 +715,24 @@ cmd_time:
     pop dx
     mov al, dh
     call print_num8
+    call crlf
+    ret
+
+cmd_mem:
+    mov dx, msg_mem
+    call print_str
+    mov ah, 36h
+    mov dl, 0
+    int 21h
+    push dx
+    push bx
+    call print_num16
+
+    mov dx, msg_mem_free
+    call print_str
+    pop ax
+    call print_num16
+    pop ax
     call crlf
     ret
 
@@ -1135,20 +1161,39 @@ cmd_exec:
 .run_bat:
     mov bx, word [bat_handle]
 .bat_loop:
-    mov cx, 128
-    mov dx, cmd_buf+2
+    xor si, si
+.bat_read_char:
+    mov dx, bat_char_buf
+    push cx
+    mov cx, 1
     mov ah, 3Fh
     int 21h
+    pop cx
     jc .bat_done
     test ax, ax
     jz .bat_done
-    mov cx, ax
-    mov bx, ax
-    mov byte [cmd_buf+2+bx], 0
+
+    mov al, byte [bat_char_buf]
+    cmp al, 0x0D
+    je .bat_exec_line
+    cmp al, 0x0A
+    je .bat_exec_line
+
+    mov byte [cmd_buf+2+si], al
+    inc si
+    cmp si, 126
+    jb .bat_read_char
+
+.bat_exec_line:
+    mov byte [cmd_buf+2+si], 0
+    test si, si
+    jz .bat_loop
 
     push bx
     call parse_cmd
+    call pre_process_io
     call dispatch
+    call post_process_io
     pop bx
     jmp .bat_loop
 .bat_done:
