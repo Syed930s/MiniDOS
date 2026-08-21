@@ -32,7 +32,7 @@ msg_notfound db "File not found",13,10,"$"
 msg_presskey db "Press any key to continue . . .$"
 msg_dirmes db " File(s)",13,10,"$"
 msg_crlf db 13,10,"$"
-msg_ver db 13,10,"MiniDOS v2.1",13,10,"$"
+msg_ver db 13,10,"MiniCOM 3.1 MiniDOS 3.3 MiniBoot 1.9",13,10,"$"
 msg_echo_on db "ECHO is on",13,10,"$"
 msg_echo_off db "ECHO is off",13,10,"$"
 msg_created db "Directory created",13,10,"$"
@@ -53,7 +53,11 @@ arg_ptr dw 0
 
 pipe_file db "PIPE.TMP",0
 bat_handle dw 0
-bat_mode db 0
+is_bat db 0
+saved_stdout dw 0
+saved_stdin dw 0
+pipe_active db 0
+pipe_right dw 0
 
 main:
     push cs
@@ -162,9 +166,10 @@ parse_cmd:
     mov byte [cmd_upper], 0
     ret
 
+; ==================================================
+; pre_process_io  --  >, <, |   (handle-saving scheme)
+; ==================================================
 pre_process_io:
-    ; Simple redirection and pipe handling
-    ; Scans for >, <, | and sets up handles
     mov si, cmd_buf+2
 .scan:
     lodsb
@@ -177,8 +182,8 @@ pre_process_io:
     cmp al, '|'
     je .handle_pipe
     jmp .scan
+
 .handle_out:
-    ; Basic > implementation (overwrite)
     dec si
     mov byte [si], 0
     inc si
@@ -188,17 +193,13 @@ pre_process_io:
     mov ah, 3Ch
     int 21h
     jc .done_io
+    mov word [saved_stdout], ax     ; remember the FILE handle
     mov bx, ax
-    push bx
-    mov bx, 1
-    mov ah, 45h
-    int 21h
-    mov word [saved_stdout], ax
-    pop bx
     mov cx, 1
     mov ah, 46h
-    int 21h
+    int 21h                         ; stdout -> file
     jmp .done_io
+
 .handle_in:
     dec si
     mov byte [si], 0
@@ -208,19 +209,14 @@ pre_process_io:
     mov ax, 3D00h
     int 21h
     jc .done_io
-    mov bx, ax
-    push bx
-    mov bx, 0
-    mov ah, 45h
-    int 21h
     mov word [saved_stdin], ax
-    pop bx
+    mov bx, ax
     mov cx, 0
     mov ah, 46h
-    int 21h
+    int 21h                         ; stdin -> file
     jmp .done_io
+
 .handle_pipe:
-    ; Pipe: run left > PIPE.TMP, then right < PIPE.TMP
     dec si
     mov byte [si], 0
     mov byte [pipe_active], 1
@@ -228,73 +224,69 @@ pre_process_io:
     mov word [pipe_right], si
     mov dx, pipe_file
     mov cx, 0
-    mov ah, 3CH
-    int 21H
+    mov ah, 3Ch
+    int 21h
     jc .done_io
-    mov bx, ax
-    push bx
-    mov bx, 1
-    mov ah, 45H
-    int 21H
     mov word [saved_stdout], ax
-    pop bx
+    mov bx, ax
     mov cx, 1
-    mov ah, 46H
-    int 21H
+    mov ah, 46h
+    int 21h                         ; stdout -> pipe file
 .done_io:
     ret
 
+; ==================================================
+; post_process_io -- restore console, run pipe right side
+; ==================================================
 post_process_io:
     cmp byte [pipe_active], 1
     je .do_pipe
+
     cmp word [saved_stdout], 0
     je .check_in
     mov bx, word [saved_stdout]
+    mov ah, 3Eh
+    int 21h                         ; close the file
+    mov bx, 0
     mov cx, 1
     mov ah, 46h
-    int 21h
-    mov bx, word [saved_stdout]
-    mov ah, 3Eh
-    int 21h
+    int 21h                         ; console back onto stdout
     mov word [saved_stdout], 0
+
 .check_in:
     cmp word [saved_stdin], 0
     je .done_post
     mov bx, word [saved_stdin]
-    mov cx, 0
-    mov ah, 46h
-    int 21h
-    mov bx, word [saved_stdin]
     mov ah, 3Eh
     int 21h
+    mov bx, 1
+    mov cx, 0
+    mov ah, 46h
+    int 21h                         ; console back onto stdin
     mov word [saved_stdin], 0
 .done_post:
     ret
+
 .do_pipe:
     mov byte [pipe_active], 0
     mov bx, word [saved_stdout]
+    mov ah, 3Eh
+    int 21h                         ; close pipe writer
+    mov bx, 0
     mov cx, 1
     mov ah, 46h
-    int 21h
-    mov bx, word [saved_stdout]
-    mov ah, 3Eh
-    int 21h
+    int 21h                         ; console stdout back
     mov word [saved_stdout], 0
 
     mov dx, pipe_file
     mov ax, 3D00h
     int 21h
     jc .pipe_end
-    mov bx, ax
-    push bx
-    mov bx, 0
-    mov ah, 45h
-    int 21h
     mov word [saved_stdin], ax
-    pop bx
+    mov bx, ax
     mov cx, 0
     mov ah, 46h
-    int 21h
+    int 21h                         ; stdin -> pipe file
 
     mov si, word [pipe_right]
     mov di, cmd_buf+2
@@ -304,16 +296,15 @@ post_process_io:
     test al, al
     jnz .copy_right
 
-    mov byte [cmd_buf+1], 0
     call parse_cmd
     call dispatch
 
     mov bx, word [saved_stdin]
+    mov ah, 3Eh
+    int 21h
+    mov bx, 1
     mov cx, 0
     mov ah, 46h
-    int 21h
-    mov bx, word [saved_stdin]
-    mov ah, 3Eh
     int 21h
     mov word [saved_stdin], 0
 .pipe_end:
@@ -329,11 +320,6 @@ skip_spaces_si:
     jmp skip_spaces_si
 .done_skip:
     ret
-
-saved_stdout dw 0
-saved_stdin dw 0
-pipe_active db 0
-pipe_right dw 0
 
 dispatch:
     mov si, cmd_upper
@@ -387,23 +373,36 @@ dispatch:
     call strcmp
     je .do_time
 
-    jmp .do_exec
-
-.do_dir: jmp cmd_dir
-.do_cls: jmp cmd_cls
-.do_ver: jmp cmd_ver
-.do_echo: jmp cmd_echo
-.do_cd: jmp cmd_cd
-.do_md: jmp cmd_md
-.do_rd: jmp cmd_rd
-.do_del: jmp cmd_del
-.do_ren: jmp cmd_ren
-.do_type: jmp cmd_type
-.do_copy: jmp cmd_copy
-.do_pause: jmp cmd_pause
-.do_date: jmp cmd_date
-.do_time: jmp cmd_time
-.do_exec: jmp cmd_exec
+.do_exec: call cmd_exec
+    ret
+.do_dir: call cmd_dir
+    ret
+.do_cls: call cmd_cls
+    ret
+.do_ver: call cmd_ver
+    ret
+.do_echo: call cmd_echo
+    ret
+.do_cd: call cmd_cd
+    ret
+.do_md: call cmd_md
+    ret
+.do_rd: call cmd_rd
+    ret
+.do_del: call cmd_del
+    ret
+.do_ren: call cmd_ren
+    ret
+.do_type: call cmd_type
+    ret
+.do_copy: call cmd_copy
+    ret
+.do_pause: call cmd_pause
+    ret
+.do_date: call cmd_date
+    ret
+.do_time: call cmd_time
+    ret
 
 strcmp:
     push si
@@ -470,23 +469,19 @@ print_num8:
     push bx
     push cx
     push dx
-
     xor ah, ah
     mov bl, 10
     div bl
     push ax
-
     mov dl, al
     add dl, 30h
     mov ah, 02h
     int 21h
-
     pop ax
     mov dl, ah
     add dl, 30h
     mov ah, 02h
     int 21h
-
     pop dx
     pop cx
     pop bx
@@ -498,7 +493,6 @@ print_num16:
     push bx
     push cx
     push dx
-
     mov cx, 0
     mov bx, 10
 .loop1:
@@ -514,7 +508,6 @@ print_num16:
     mov ah, 02h
     int 21h
     loop .loop2
-
     pop dx
     pop cx
     pop bx
@@ -998,6 +991,7 @@ cmd_exec:
     pop ds
     push cs
     pop es
+    mov byte [is_bat], 0
 
     mov si, cmd_upper
     mov di, find_name
@@ -1012,7 +1006,7 @@ cmd_exec:
 .pad:
     mov al, ' '
     stosb
-    loop .copy8
+    loop .pad
 .dot:
     mov al, '.'
     stosb
@@ -1027,11 +1021,11 @@ cmd_exec:
     mov ah, 1Ah
     mov dx, dta_buf
     int 21h
+
     mov dx, find_name
-    mov cx, 0
     mov ah, 4Eh
     int 21h
-    jnc .found_com
+    jnc .open_it
 
     mov si, cmd_upper
     mov di, find_name
@@ -1046,7 +1040,7 @@ cmd_exec:
 .pad_bat:
     mov al, ' '
     stosb
-    loop .copy8_bat
+    loop .pad_bat
 .dot_bat:
     mov al, '.'
     stosb
@@ -1057,19 +1051,24 @@ cmd_exec:
     mov al, 'T'
     stosb
     mov byte [di], 0
+
+    mov dx, find_name
+    mov ah, 4Eh
+    int 21h
+    jc .not_found_exec
+    mov byte [is_bat], 1
+
+.open_it:
     mov dx, find_name
     mov ax, 3D00h
     int 21h
     jc .not_found_exec
     mov word [bat_handle], ax
-    jmp .run_bat
 
-.found_com:
-    mov dx, find_name
-    mov ax, 3D00h
-    int 21h
-    jc .not_found_exec
-    mov bx, ax
+    cmp byte [is_bat], 1
+    je .run_bat
+
+    mov bx, word [bat_handle]
 
     push bx
     mov ax, 3000h
@@ -1143,7 +1142,8 @@ cmd_exec:
     test ax, ax
     jz .bat_done
     mov cx, ax
-    mov byte [cmd_buf+2+cx], 0
+    mov bx, ax
+    mov byte [cmd_buf+2+bx], 0
 
     push bx
     call parse_cmd
